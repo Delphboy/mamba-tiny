@@ -22,6 +22,7 @@ Glossary:
 
 from __future__ import annotations
 
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,7 +64,7 @@ class CrossMambaBlock(nn.Module):
         self.D = nn.Parameter(torch.ones(args.d_inner))
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=args.bias)
 
-    def forward(self, query, x):
+    def forward(self, text_input, visual_input):
         """Mamba block forward. This looks the same as Figure 3 in Section 3.4 in the Mamba paper [1].
 
         Args:
@@ -77,19 +78,19 @@ class CrossMambaBlock(nn.Module):
             mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
 
         """
-        (b, l, d) = query.shape
+        (b, l, d) = text_input.shape
 
-        x_and_res = self.in_proj(query)  # shape (b, l, 2 * d_in)
-        x = self.in_proj2(x)  # shape (b, l, 2 * d_in)
-        (query, res) = x_and_res.split(split_size=[self.args.d_inner, self.args.d_inner], dim=-1)
+        x_and_res = self.in_proj(text_input)  # shape (b, l, 2 * d_in)
+        visual_input = self.in_proj2(visual_input)  # shape (b, l, 2 * d_in)
+        (text_input, res) = x_and_res.split(split_size=[self.args.d_inner, self.args.d_inner], dim=-1)
 
-        query = rearrange(query, 'b l d_in -> b d_in l')
-        query = self.conv1d(query)[:, :, :l]
-        query = rearrange(query, 'b d_in l -> b l d_in')
+        text_input = rearrange(text_input, 'b l d_in -> b d_in l')
+        text_input = self.conv1d(text_input)[:, :, :l]
+        text_input = rearrange(text_input, 'b d_in l -> b l d_in')
 
-        query = F.silu(query)
+        text_input = F.silu(text_input)
 
-        y = self.ssm(query, x)
+        y = self.ssm(text_input, visual_input)
 
         y = y * F.silu(res)
 
@@ -130,21 +131,21 @@ class CrossMambaBlock(nn.Module):
 
         return selective_scan(query, delta, A, B, C, D, mode=self.args.scan_mode)  # This is similar to run_SSM(A, B, C, u) in The Annotated S4 [2]
 
-class Mamba(nn.Module):
+class TinyCrossMamba(nn.Module):
     def __init__(self, args: ModelArgs):
         """Full Mamba model."""
         super().__init__()
         self.args = args
         
         self.embedding = nn.Embedding(args.vocab_size, args.d_model)
-        self.layers = nn.ModuleList([ResidualBlock(args) for _ in range(args.n_layer)])
+        self.layers = nn.ModuleList([ResidualCrossBlock(args) for _ in range(args.n_layer)])
         self.norm_f = RMSNorm(args.d_model)
 
         self.lm_head = nn.Linear(args.d_model, args.vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight  # Tie output projection to embedding weights.
                                                      # See "Weight Tying" paper
 
-    def forward(self, input_ids):
+    def forward(self, text_input, visual_input):
         """
         Args:
             input_ids (long tensor): shape (b, l)    (See Glossary at top for definitions of b, l, d_in, n...)
@@ -156,10 +157,10 @@ class Mamba(nn.Module):
             class MambaLMHeadModel, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L173
 
         """
-        x = self.embedding(input_ids)
+        x = self.embedding(text_input)
         
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, visual_input)
             
         x = self.norm_f(x)
         return self.lm_head(x)
@@ -197,7 +198,7 @@ class Mamba(nn.Module):
         
         if model is None:
             config_data = load_config_hf(pretrained_model_name)
-            model = Mamba(ModelArgs(
+            model = TinyCrossMamba(ModelArgs(
                 d_model=config_data['d_model'], 
                 n_layer=config_data['n_layer'], 
                 vocab_size=config_data['vocab_size'], 
@@ -213,3 +214,29 @@ class Mamba(nn.Module):
         
         model.load_state_dict(model_dict)
         return model
+
+class ResidualCrossBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.mixer = CrossMambaBlock(args)
+        self.norm = RMSNorm(args.d_model)
+
+    def forward(self, query, x):
+        return self.mixer(self.norm(query), self.norm(x)) + query
+
+
+
+
+class RMSNorm(nn.Module):
+    def __init__(self,
+                 d_model: int,
+                 eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+        return output

@@ -17,6 +17,7 @@ class ModelArgs:
     conv_bias: bool = True
     bias: bool = False
     scan_mode: str = 'cumsum'
+    layer_type: str = 'mamba'
 
     def __post_init__(self):
         self.d_inner = int(self.expand * self.d_model)
@@ -26,4 +27,5 @@ class ModelArgs:
         if self.vocab_size % self.pad_vocab_size_multiple != 0:
             self.vocab_size += (self.pad_vocab_size_multiple
                                 - self.vocab_size % self.pad_vocab_size_multiple)
+        assert self.layer_type in ["mamba","cross_mamba"], f"Received invalid layer_type {self.layer_type}"
 

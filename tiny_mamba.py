@@ -31,7 +31,7 @@ from scans import selective_scan
 
 from model_args import ModelArgs
 
-class MambaBlock(nn.Module):
+class TinyMambaBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         """A single Mamba block, as described in Figure 3 in Section 3.4 in the Mamba paper [1]."""
         super().__init__()
@@ -123,7 +123,7 @@ class MambaBlock(nn.Module):
 
         return selective_scan(x, delta, A, B, C, D, mode=self.args.scan_mode)  # This is similar to run_SSM(A, B, C, u) in The Annotated S4 [2]
 
-class Mamba(nn.Module):
+class TinyMamba(nn.Module):
     def __init__(self, args: ModelArgs):
         """Full Mamba model."""
         super().__init__()
@@ -190,7 +190,7 @@ class Mamba(nn.Module):
         
         if model is None:
             config_data = load_config_hf(pretrained_model_name)
-            model = Mamba(ModelArgs(
+            model = TinyMamba(ModelArgs(
                 d_model=config_data['d_model'], 
                 n_layer=config_data['n_layer'], 
                 vocab_size=config_data['vocab_size'], 
@@ -206,3 +206,46 @@ class Mamba(nn.Module):
         
         model.load_state_dict(model_dict)
         return model
+
+class ResidualBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        """Simple block wrapping Mamba block with normalization and residual connection."""
+        super().__init__()
+        self.args = args
+        self.mixer = TinyMambaBlock(args)
+        self.norm = RMSNorm(args.d_model)
+
+    def forward(self, x):
+        """
+        Args:
+            x: shape (b, l, d)    (See Glossary at top for definitions of b, l, d_in, n...)
+
+        Returns:
+            output: shape (b, l, d)
+
+        Official Implementation:
+            Block.forward(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py#L297
+
+            Note: the official repo chains residual blocks that look like
+                [Add -> Norm -> Mamba] -> [Add -> Norm -> Mamba] -> [Add -> Norm -> Mamba] -> ...
+            where the first Add is a no-op. This is purely for performance reasons as this
+            allows them to fuse the Add->Norm.
+
+            We instead implement our blocks as the more familiar, simpler, and numerically equivalent
+                [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> ....
+
+        """
+        return self.mixer(self.norm(x)) + x
+
+class RMSNorm(nn.Module):
+    def __init__(self,
+                 d_model: int,
+                 eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+        return output
